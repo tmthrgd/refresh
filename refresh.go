@@ -14,8 +14,9 @@ type value struct {
 	val interface{}
 	err error
 
-	when    time.Time
-	refresh sync.Once
+	when         time.Time
+	refresh      sync.Once // used if !staleWhileRefresh || when.IsZero()
+	refreshStale uint32    // used if staleWhileRefresh && !when.IsZero()
 }
 
 // Refresher is an object that will perform an action at most once every
@@ -25,6 +26,8 @@ type Refresher struct {
 
 	maxAge    time.Duration
 	refreshFn func() (interface{}, error)
+
+	staleWhileRefresh bool
 }
 
 // New returns a Refresher that will call refreshFn at most once every maxAge
@@ -36,25 +39,55 @@ func New(maxAge time.Duration, refreshFn func() (interface{}, error)) *Refresher
 		panic("refresh: maxAge must be positive duration")
 	}
 
-	r := &Refresher{atomic.Value{}, maxAge, refreshFn}
+	r := &Refresher{atomic.Value{}, maxAge, refreshFn, false}
 	r.val.Store(new(value))
 	return r
 }
 
-// Load returns a value that is at most maxAge old. If the value is stale, it
-// will block calling the refreshFn given to New. Load will only ever return an
-// error that was returned from refreshFn.
+// SetStaleWhileRefresh controls the behaviour of Load when the value is stale.
+// When set to true, only one call to Load will block while any others return
+// stale data. When set to false, all calls to Load will block and only ever
+// return fresh data. It defaults to false.
+func (r *Refresher) SetStaleWhileRefresh(v bool) {
+	r.staleWhileRefresh = v
+}
+
+// Load returns a value that is at most maxAge old. Load will only ever return
+// an error that was returned from refreshFn.
+//
+// The behaviour of Load when the value is stale can be controlled by
+// SetStaleWhileRefresh. If the value is stale, it will either block all Load
+// calls to call the refreshFn given to New, or only the first Load call.
 func (r *Refresher) Load() (interface{}, error) {
 	val := r.val.Load().(*value)
-	if time.Since(val.when) <= r.maxAge && !testNeedsRefresh {
+	switch {
+	case testNeedsRefresh:
+	case val.when.IsZero(): // first Load
+	case time.Since(val.when) <= r.maxAge:
 		return val.val, val.err
+	case r.staleWhileRefresh:
+		return r.loadStale(val)
 	}
 
+	return r.loadFresh(val)
+}
+
+func (r *Refresher) loadFresh(val *value) (interface{}, error) {
 	val.refresh.Do(func() {
-		val, err := r.refreshFn()
-		r.val.Store(&value{val, err, time.Now(), sync.Once{}})
+		newVal, err := r.refreshFn()
+		r.val.Store(&value{newVal, err, time.Now(), sync.Once{}, 0})
 	})
 
 	val = r.val.Load().(*value)
 	return val.val, val.err
+}
+
+func (r *Refresher) loadStale(val *value) (interface{}, error) {
+	if !atomic.CompareAndSwapUint32(&val.refreshStale, 0, 1) {
+		return val.val, val.err
+	}
+
+	newVal, err := r.refreshFn()
+	r.val.Store(&value{newVal, err, time.Now(), sync.Once{}, 0})
+	return newVal, err
 }

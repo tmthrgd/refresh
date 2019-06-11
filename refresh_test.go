@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ func ExampleNew_http() {
 	r := New(30*time.Minute, func() (interface{}, error) {
 		return expensiveCall()
 	})
+	r.SetStaleWhileRefresh(true)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		data, err := r.Load()
@@ -76,10 +78,9 @@ func TestRefresher(t *testing.T) {
 }
 
 func TestRefresherParallel(t *testing.T) {
-	var called int
+	var called int32
 	r := New(time.Hour, func() (interface{}, error) {
-		called++
-		return called, nil
+		return int(atomic.AddInt32(&called, 1)), nil
 	})
 
 	var (
@@ -102,7 +103,7 @@ func TestRefresherParallel(t *testing.T) {
 	close(wait)
 	wg.Wait()
 
-	assert.Equal(t, 1, called)
+	assert.Equal(t, int32(1), called)
 }
 
 func TestRefresherTime(t *testing.T) {
@@ -121,4 +122,86 @@ func TestRefresherTime(t *testing.T) {
 	c, err = r.Load()
 	assert.NoError(t, err)
 	assert.Equal(t, 2, c)
+}
+
+func TestRefresherStaleParallel(t *testing.T) {
+	var called int32
+	r := New(time.Millisecond, func() (interface{}, error) {
+		time.Sleep(10 * time.Millisecond)
+		return int(atomic.AddInt32(&called, 1)), nil
+	})
+	r.SetStaleWhileRefresh(true)
+
+	// Run the first Load and wait for the data to be stale.
+	c, err := r.Load()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, c)
+
+	time.Sleep(10 * time.Millisecond)
+
+	var (
+		wg       sync.WaitGroup
+		wait     = make(chan struct{})
+		sawFresh int32
+	)
+	for n := 0; n < runtime.NumCPU(); n++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			<-wait
+
+			c, err := r.Load()
+			assert.NoError(t, err)
+			if assert.Truef(t, c == 1 || c == 2, "c(%d) should be 1 or 2", c) {
+				atomic.AddInt32(&sawFresh, int32(c.(int))-1)
+			}
+		}()
+	}
+
+	close(wait)
+	wg.Wait()
+
+	assert.Equal(t, int32(2), called)
+	assert.Equal(t, int32(1), sawFresh, "sawFresh") // The rest must have seen stale data.
+}
+
+func TestRefresherStaleParallelFirstLoad(t *testing.T) {
+	var called int32
+	r := New(time.Hour, func() (interface{}, error) {
+		return int(atomic.AddInt32(&called, 1)), nil
+	})
+	r.SetStaleWhileRefresh(true)
+
+	var (
+		wg   sync.WaitGroup
+		wait = make(chan struct{})
+	)
+	for n := 0; n < runtime.NumCPU(); n++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			<-wait
+
+			c, err := r.Load()
+			assert.NoError(t, err)
+			assert.Equal(t, 1, c)
+		}()
+	}
+
+	close(wait)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), called)
+}
+
+func TestNewPanicsForInvalidMaxAge(t *testing.T) {
+	dummy := func() (interface{}, error) { return nil, nil }
+	assert.PanicsWithValue(t, "refresh: maxAge must be positive duration", func() {
+		New(0, dummy)
+	}, "maxAge is 0")
+	assert.PanicsWithValue(t, "refresh: maxAge must be positive duration", func() {
+		New(-1, dummy)
+	}, "maxAge is -1")
 }

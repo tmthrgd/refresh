@@ -19,6 +19,7 @@ The following is an example of using **refresh** with [`net/http`](https://golan
 r := refresh.New(30*time.Minute, func() (interface{}, error) {
 	return expensiveCall()
 })
+r.SetStaleWhileRefresh(true)
 
 http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 	data, err := r.Load()
